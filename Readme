@@ -1,0 +1,832 @@
+# Enterprise Hybrid AWS Network — Transit Gateway + VPN + Multi-VPC Secure Architecture
+
+> **AWS Networking Series — Project 4** | Built hands-on in AWS Console | Region: us-east-1 | Duration: ~4 hours
+
+---
+
+## Table of Contents
+
+1. [Project Overview](#project-overview)
+2. [Architecture Diagram](#architecture-diagram)
+3. [What Was Built](#what-was-built)
+4. [CIDR & Resource Reference](#cidr--resource-reference)
+5. [Phase 1 — VPC & Subnet Foundation](#phase-1--vpc--subnet-foundation)
+6. [Phase 2 — Internet Gateway & NAT Gateway](#phase-2--internet-gateway--nat-gateway)
+7. [Phase 3 — Transit Gateway & Route Isolation](#phase-3--transit-gateway--route-isolation)
+8. [Phase 4 — EC2 Instances & SSM Access](#phase-4--ec2-instances--ssm-access)
+9. [Phase 5 — Site-to-Site VPN Hybrid Connectivity](#phase-5--site-to-site-vpn-hybrid-connectivity)
+10. [Test Results](#test-results)
+11. [Mistakes Made & How They Were Fixed](#mistakes-made--how-they-were-fixed)
+12. [Key Concepts Explained](#key-concepts-explained)
+13. [Cost Analysis](#cost-analysis)
+14. [Cleanup Order](#cleanup-order)
+15. [Screenshots Index](#screenshots-index)
+
+---
+
+## Project Overview
+
+This project implements a **production-grade hybrid AWS network** that mirrors how large enterprises actually connect their on-premises data centers to AWS. It combines three of the most important AWS networking patterns into a single working architecture:
+
+**1. Multi-VPC segmentation** — Three separate VPCs (Web, App, DB) representing a classic 3-tier application architecture, each with its own security boundary.
+
+**2. Transit Gateway route isolation** — Strict routing rules enforced at the network layer, not the security group layer. Traffic that has no route is silently dropped before it even reaches its destination.
+
+**3. Hybrid connectivity via Site-to-Site VPN** — A simulated on-premises environment connected to AWS through an IPSec VPN tunnel using libreswan, replicating how a real corporate data center connects to the cloud.
+
+This is not a beginner project. It reflects the architecture used by financial institutions, healthcare organizations, and large enterprises running hybrid cloud workloads.
+
+---
+
+## Architecture Diagram
+
+```
+                        INTERNET
+                            |
+              ┌─────────────┴──────────────┐
+              |         Web-VPC            |
+              |       10.1.0.0/16          |
+              |  ┌──────────────────────┐  |
+              |  │  Web-Public-1a       │  |
+              |  │  10.1.1.0/24         │  |
+              |  │  [Web-EC2 10.1.1.91] │  |
+              |  │  [Web-IGW]           │  |
+              |  └──────────────────────┘  |
+              └─────────────┬──────────────┘
+                            |
+              ┌─────────────┴──────────────┐
+              |       App-VPC              |
+              |      10.2.0.0/16           |
+              |  ┌─────────────────────┐   |
+              |  │ App-Public-1a       │   |
+              |  │ 10.2.1.0/24         │   |
+              |  │ [App-IGW][App-NATGW]│   |
+              |  └─────────────────────┘   |
+              |  ┌─────────────────────┐   |
+              |  │ App-Private-1a      │   |
+              |  │ 10.2.2.0/24         │   |
+              |  │[App-EC2 10.2.2.206] │   |
+              |  └─────────────────────┘   |
+              └─────────────┬──────────────┘
+                            |
+  ┌─────────────────────────┴──────────────────────────┐
+  |                TRANSIT GATEWAY                      |
+  |                Enterprise-TGW                       |
+  |                                                     |
+  |  TGW-RT-Web    TGW-RT-App    TGW-RT-DB             |
+  |  (Web uses)    (App uses)    (DB uses)              |
+  |  → App only    → Web+DB      → App only             |
+  |                                                     |
+  |              TGW-RT-OnPrem                          |
+  |              (VPN uses)                             |
+  |              → Web+App only (DB BLOCKED)            |
+  └──────┬───────────────┬──────────────┬──────────────┘
+         |               |              |
+┌────────┴───────┐  ┌────┴─────────┐  ┌┴──────────────────────┐
+|    DB-VPC      |  | IPSec Tunnel |  |  OnPrem-VPC            |
+|  10.3.0.0/16   |  | (Encrypted)  |  |  192.168.0.0/16        |
+| ┌────────────┐ |  └──────────────┘  | ┌────────────────────┐ |
+| │DB-Private  │ |                    | │OnPrem-Public-1a    │ |
+| │10.3.1.0/24 │ |                    | │192.168.1.0/24      │ |
+| │[DB-EC2]    │ |                    | │[StrongSwan EC2]    │ |
+| └────────────┘ |                    | │[libreswan VPN GW]  │ |
+└────────────────┘                    | └────────────────────┘ |
+                                      └────────────────────────┘
+
+TRAFFIC RULES:
+  Web  → App:     ✅ ALLOWED (TGW-RT-Web has App route)
+  App  → DB:      ✅ ALLOWED (TGW-RT-App has DB route)
+  Web  → DB:      ❌ BLOCKED (TGW-RT-Web has NO DB route)
+  OnPrem → Web:   ✅ ALLOWED via VPN tunnel
+  OnPrem → App:   ✅ ALLOWED via VPN tunnel
+  OnPrem → DB:    ❌ BLOCKED (TGW-RT-OnPrem has NO DB route)
+  App  → Internet:✅ via App-NAT-GW → App-IGW
+```
+
+---
+
+## What Was Built
+
+| Component | Name | Purpose |
+|---|---|---|
+| VPC | Web-VPC | Internet-facing tier |
+| VPC | App-VPC | Application tier |
+| VPC | DB-VPC | Data tier — most restricted |
+| VPC | OnPrem-VPC | Simulated on-premises data center |
+| IGW | Web-IGW | Internet access for Web-VPC |
+| IGW | App-IGW | Required for NAT Gateway |
+| IGW | OnPrem-IGW | Internet for StrongSwan VPN |
+| NAT GW | App-NAT-GW | Outbound internet for private EC2s |
+| Transit Gateway | Enterprise-TGW | Central routing hub |
+| TGW Attachment | TGW-Attach-Web | Connects Web-VPC to TGW |
+| TGW Attachment | TGW-Attach-App | Connects App-VPC to TGW |
+| TGW Attachment | TGW-Attach-DB | Connects DB-VPC to TGW |
+| TGW Attachment | VPN Attachment | Connects VPN tunnel to TGW |
+| TGW Route Table | TGW-RT-Web | Web → App only |
+| TGW Route Table | TGW-RT-App | App → Web + DB |
+| TGW Route Table | TGW-RT-DB | DB → App only |
+| TGW Route Table | TGW-RT-OnPrem | OnPrem → Web + App only |
+| Customer Gateway | OnPrem-CGW | Represents StrongSwan on AWS side |
+| VPN Connection | OnPrem-to-AWS-VPN | IPSec VPN tunnel |
+| EC2 | Web-EC2 | Web server in public subnet |
+| EC2 | App-EC2 | App server in private subnet |
+| EC2 | DB-EC2 | DB server in private subnet |
+| EC2 | OnPrem-StrongSwan | libreswan VPN gateway |
+| IAM Role | EC2-SSM-Role | SSM Session Manager access |
+| VPC Endpoints x6 | SSM endpoints | SSM on private EC2s |
+
+---
+
+## CIDR & Resource Reference
+
+### VPCs
+
+| Name | VPC ID | CIDR | Purpose |
+|---|---|---|---|
+| Web-VPC | vpc-061c06cc28ee85e4d | 10.1.0.0/16 | Internet-facing tier |
+| App-VPC | vpc-0791c4e5f20029807 | 10.2.0.0/16 | Application tier |
+| DB-VPC | vpc-0934814795346612a | 10.3.0.0/16 | Database tier |
+| OnPrem-VPC | vpc-005e7e783ec224ff5 | 192.168.0.0/16 | Simulated on-premises |
+
+### Subnets
+
+| Name | CIDR | Type | VPC |
+|---|---|---|---|
+| Web-Public-1a | 10.1.1.0/24 | Public | Web-VPC |
+| Web-Private-1a | 10.1.2.0/24 | Private | Web-VPC |
+| App-Public-1a | 10.2.1.0/24 | Public (NAT GW here) | App-VPC |
+| App-Private-1a | 10.2.2.0/24 | Private (EC2 here) | App-VPC |
+| DB-Private-1a | 10.3.1.0/24 | Private (no internet) | DB-VPC |
+| OnPrem-Public-1a | 192.168.1.0/24 | Public (StrongSwan) | OnPrem-VPC |
+
+### EC2 Instances
+
+| Name | Private IP | Public IP | VPC |
+|---|---|---|---|
+| Web-EC2 | 10.1.1.91 | 18.214.39.55 | Web-VPC |
+| App-EC2 | 10.2.2.206 | None | App-VPC |
+| DB-EC2 | 10.3.1.86 | None | DB-VPC |
+| OnPrem-StrongSwan | 192.168.1.175 | 3.231.95.69 | OnPrem-VPC |
+
+### VPN Tunnel Details
+
+| Detail | Value |
+|---|---|
+| VPN Connection ID | vpn-0524cd316ca022280 |
+| Customer Gateway ID | cgw-0269c7e6f32e4bec4 |
+| AWS Tunnel 1 Outside IP | 18.213.129.131 |
+| StrongSwan Outside IP | 3.231.95.69 |
+| AWS Inside IP | 169.254.181.205/30 |
+| StrongSwan Inside IP | 169.254.181.206/30 |
+| IKE Version | IKEv2 |
+| Encryption | AES-128-CBC |
+| Integrity | SHA-256 |
+| DH Group | 14 (modp2048) |
+
+---
+
+## Phase 1 — VPC & Subnet Foundation
+
+### Why 4 VPCs?
+
+Each VPC is a completely isolated network. Resources in one VPC cannot communicate with resources in another VPC without an explicit connection. We use 4 VPCs to enforce security isolation by design:
+
+- Web is internet-facing and has higher attack surface
+- App contains business logic — only Web should talk to it
+- DB contains sensitive data — only App should reach it
+- OnPrem is a completely different network simulating a corporate data center
+
+### Why different CIDRs?
+
+CIDRs must not overlap. If two VPCs had the same CIDR, the Transit Gateway could not determine where to route packets.
+
+```
+Web:    10.1.0.0/16 → 65,536 addresses
+App:    10.2.0.0/16 → 65,536 addresses
+DB:     10.3.0.0/16 → 65,536 addresses
+OnPrem: 192.168.0.0/16 → completely different range
+```
+
+### Why public AND private subnets?
+
+Not every resource needs internet exposure. Public subnets route to an IGW (internet accessible). Private subnets have no IGW route (internal only).
+
+This is defense in depth — even if the web server is compromised, the database is in a completely private subnet with no internet path whatsoever.
+
+### Route tables — what they are and why each subnet needs one
+
+A route table is like a GPS for network packets. Every packet leaving a subnet checks the route table to find out where to go.
+
+Without an explicit route, the subnet only knows about addresses within the same VPC (the local route that AWS adds automatically).
+
+We created 6 custom route tables:
+
+| Route Table | Subnet | Key Routes |
+|---|---|---|
+| Web-Public-RT | Web-Public-1a | 0.0.0.0/0 → Web-IGW, 10.2.0.0/16 → TGW |
+| Web-Private-RT | Web-Private-1a | 10.2.0.0/16 → TGW |
+| App-Public-RT | App-Public-1a | 0.0.0.0/0 → App-IGW |
+| App-Private-RT | App-Private-1a | 0.0.0.0/0 → App-NAT-GW, 10.x → TGW |
+| DB-Private-RT | DB-Private-1a | 10.2.0.0/16 → TGW |
+| OnPrem-Public-RT | OnPrem-Public-1a | 0.0.0.0/0 → OnPrem-IGW |
+
+---
+
+## Phase 2 — Internet Gateway & NAT Gateway
+
+### Internet Gateway — 3 created, DB has none
+
+An IGW is the door between a VPC and the internet. Without it, nothing in the VPC can reach or be reached from the internet.
+
+| VPC | IGW | Why |
+|---|---|---|
+| Web-VPC | Web-IGW | Web-EC2 needs public IP and internet access |
+| App-VPC | App-IGW | NAT Gateway needs IGW in same VPC |
+| OnPrem-VPC | OnPrem-IGW | StrongSwan needs internet for VPN tunnel |
+| DB-VPC | NONE | DB must never touch internet |
+
+### NAT Gateway — must live in public subnet
+
+NAT Gateway translates private IP addresses to a public IP so private EC2s can initiate outbound internet connections without being directly reachable from the internet.
+
+```
+Private App-EC2 (10.2.2.206)
+  → App-Private-RT: 0.0.0.0/0 → App-NAT-GW
+  → NAT GW translates to Elastic IP
+  → App-Public-RT: 0.0.0.0/0 → App-IGW
+  → Internet ✅
+```
+
+NAT Gateway MUST live in a public subnet because it needs to forward traffic to an IGW. A public subnet is defined as a subnet with a route to an IGW.
+
+### DB internet traffic
+
+DB-VPC has no NAT Gateway and no IGW. If DB needs internet access (e.g., for SSM agent), traffic flows through TGW to App-VPC and uses App's NAT:
+
+```
+DB-EC2 → TGW → App-Private-1a → App-NAT-GW → App-IGW → Internet
+```
+
+---
+
+## Phase 3 — Transit Gateway & Route Isolation
+
+### What is Transit Gateway?
+
+Transit Gateway is a regional AWS resource that acts as a central router sitting outside all VPCs. Each VPC connects a TGW attachment (essentially a network cable) into the TGW. The TGW uses route tables to decide where to forward packets.
+
+Without TGW, VPCs are completely isolated. TGW is the scalable solution for connecting multiple VPCs.
+
+### Why default association and propagation were disabled
+
+When creating the TGW, two settings were explicitly disabled:
+
+If LEFT ENABLED, AWS automatically creates one shared route table and all VPC attachments auto-join it:
+
+```
+Default TGW Route Table (dangerous — everyone sees everyone):
+10.1.0.0/16 → Web
+10.2.0.0/16 → App
+10.3.0.0/16 → DB
+192.168.0.0/16 → OnPrem
+```
+
+This means Web can reach DB and OnPrem can reach DB. Our entire security model collapses.
+
+By DISABLING defaults, TGW starts empty with no routes. We manually control everything.
+
+### Associations vs Propagations
+
+This is the most important concept to understand.
+
+**Association** answers: "Which route table does THIS VPC use when SENDING traffic?"
+
+Each attachment is associated with exactly one TGW route table. When a packet leaves a VPC through TGW, the TGW looks up the destination in that VPC's associated route table.
+
+**Propagation** answers: "Which VPCs does THIS route table automatically learn routes FROM?"
+
+When you propagate Attachment X into Route Table Y, TGW automatically adds Attachment X's VPC CIDR as a route in Route Table Y.
+
+### Association table
+
+| Route Table | Associated Attachment | Meaning |
+|---|---|---|
+| TGW-RT-Web | TGW-Attach-Web | Web VPC follows Web rules |
+| TGW-RT-App | TGW-Attach-App | App VPC follows App rules |
+| TGW-RT-DB | TGW-Attach-DB | DB VPC follows DB rules |
+| TGW-RT-OnPrem | VPN attachment | OnPrem VPN follows OnPrem rules |
+
+### Propagation table
+
+| Route Table | Propagated From | Route Learned | Why |
+|---|---|---|---|
+| TGW-RT-Web | TGW-Attach-App | 10.2.0.0/16 | Web can reach App |
+| TGW-RT-App | TGW-Attach-Web | 10.1.0.0/16 | App can reach Web |
+| TGW-RT-App | TGW-Attach-DB | 10.3.0.0/16 | App can reach DB |
+| TGW-RT-DB | TGW-Attach-App | 10.2.0.0/16 | DB can reply to App |
+| TGW-RT-OnPrem | TGW-Attach-Web | 10.1.0.0/16 | OnPrem can reach Web |
+| TGW-RT-OnPrem | TGW-Attach-App | 10.2.0.0/16 | OnPrem can reach App |
+
+What is NOT propagated:
+- DB CIDR not in TGW-RT-Web → Web cannot reach DB
+- DB CIDR not in TGW-RT-OnPrem → OnPrem cannot reach DB
+
+### Static routes
+
+Propagations only learn VPC CIDRs automatically. VPN CIDR ranges and internet routes must be added manually:
+
+| Route Table | Static Route | Target | Why |
+|---|---|---|---|
+| TGW-RT-App | 192.168.0.0/16 | VPN attachment | App can reach OnPrem |
+| TGW-RT-Web | 192.168.0.0/16 | VPN attachment | Web can reach OnPrem |
+| TGW-RT-OnPrem | 192.168.0.0/16 | VPN attachment | Return traffic to OnPrem |
+
+### How route isolation works
+
+Route isolation is not a firewall rule or security group deny. It works because there is no route.
+
+When Web-EC2 tries to reach DB-EC2 (10.3.1.86):
+1. Packet arrives at TGW
+2. TGW looks up 10.3.1.86 in TGW-RT-Web
+3. TGW-RT-Web has no route for 10.3.0.0/16
+4. Packet is silently dropped
+5. DB-EC2 never sees the packet
+
+This is stronger than security groups because the packet is dropped at the routing layer before it even gets near the destination.
+
+---
+
+## Phase 4 — EC2 Instances & SSM Access
+
+### Why SSM Session Manager instead of SSH
+
+Traditional SSH access requires port 22 open, key pair management, and bastion hosts for private instances. SSM Session Manager replaces all of this with zero exposed ports.
+
+| Traditional SSH | SSM Session Manager |
+|---|---|
+| Port 22 must be open | No ports needed |
+| Public IP or bastion required | Works on private instances |
+| Key pair management | IAM role only |
+| No audit trail | Full session logging |
+
+### IAM Role — EC2-SSM-Role
+
+Every EC2 needs the `AmazonSSMManagedInstanceCore` policy attached. This allows the SSM agent running on the EC2 to communicate with the AWS SSM service.
+
+### VPC Endpoints for SSM
+
+Private EC2s cannot reach the AWS SSM service over the internet because they have no internet path. VPC endpoints create a private connection from inside the VPC directly to the AWS service.
+
+Three endpoints are required per private VPC:
+
+| Endpoint | Service | Purpose |
+|---|---|---|
+| SSM | com.amazonaws.us-east-1.ssm | Main SSM service |
+| SSMMessages | com.amazonaws.us-east-1.ssmmessages | Session Manager channel |
+| EC2Messages | com.amazonaws.us-east-1.ec2messages | Agent messaging |
+
+Missing any one of these three causes SSM to fail.
+
+---
+
+## Phase 5 — Site-to-Site VPN Hybrid Connectivity
+
+### Architecture overview
+
+```
+OnPrem-StrongSwan (192.168.1.175)
+  |
+  | Encrypted IPSec tunnel over internet
+  |
+AWS Transit Gateway VPN endpoint (18.213.129.131)
+  |
+  | Routes based on TGW-RT-OnPrem
+  |
+Web-VPC (10.1.0.0/16) ✅
+App-VPC (10.2.0.0/16) ✅
+DB-VPC (10.3.0.0/16)  ❌ blocked
+```
+
+### Step 1 — Create Customer Gateway
+
+The Customer Gateway is an AWS resource that represents the on-premises VPN device. It stores the public IP of the on-premises router so AWS knows where to send tunnel traffic.
+
+```
+Name: OnPrem-CGW
+IP Address: 3.231.95.69 (StrongSwan EC2 public IP)
+BGP ASN: 65000
+```
+
+### Step 2 — Create Site-to-Site VPN Connection
+
+This creates the actual VPN resource on the AWS side. AWS generates two tunnel endpoints with pre-shared keys.
+
+```
+Target gateway type: Transit Gateway
+Transit Gateway: Enterprise-TGW
+Customer Gateway: OnPrem-CGW
+Routing: Static
+Static prefix: 192.168.0.0/16
+```
+
+After creation, download the configuration file (Generic/Generic/Vendor Agnostic) — it contains all tunnel IPs and pre-shared keys needed for libreswan.
+
+### Step 3 — Configure libreswan on StrongSwan EC2
+
+#### SSH into the instance
+
+```bash
+ssh -i "enterprise-key.pem" ec2-user@3.231.95.69
+```
+
+This connects using the key pair. The EC2's public IP is `3.231.95.69`.
+
+#### Become root
+
+```bash
+sudo su -
+```
+
+All configuration must be done as root.
+
+#### Install libreswan
+
+```bash
+dnf install -y libreswan
+```
+
+libreswan is the IPSec implementation we use. `dnf` is the package manager on Amazon Linux 2023. `install -y` auto-confirms the installation.
+
+#### Enable IP forwarding
+
+```bash
+echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+echo "net.ipv4.conf.all.accept_redirects = 0" >> /etc/sysctl.conf
+echo "net.ipv4.conf.all.send_redirects = 0" >> /etc/sysctl.conf
+sysctl -p
+```
+
+`ip_forward = 1` — Tells the Linux kernel to forward packets between interfaces. Without this, VPN packets arrive at the EC2 but get dropped instead of forwarded.
+
+`accept_redirects = 0` — Don't accept ICMP redirect messages that could alter routing.
+
+`send_redirects = 0` — Don't send ICMP redirect messages.
+
+`sysctl -p` — Applies changes immediately without reboot.
+
+#### Create VPN tunnel configuration file
+
+```bash
+cat > /etc/ipsec.d/aws-vpn.conf << 'EOF'
+conn aws-tunnel1
+    authby=secret
+    auto=start
+    left=%defaultroute
+    leftid=3.231.95.69
+    leftsubnet=192.168.0.0/16
+    right=18.213.129.131
+    rightsubnet=10.0.0.0/8
+    ikev2=insist
+    ike=aes128-sha256;modp2048
+    esp=aes128-sha256;modp2048
+    type=tunnel
+    pfs=no
+    dpddelay=10
+    dpdtimeout=30
+    dpdaction=restart
+    ikelifetime=28800s
+    salifetime=3600s
+    keyingtries=%forever
+EOF
+```
+
+Line by line explanation:
+
+`conn aws-tunnel1` — Name of this VPN connection profile.
+
+`authby=secret` — Authenticate using pre-shared key (PSK).
+
+`auto=start` — Start tunnel automatically when libreswan starts. Reconnect if tunnel drops.
+
+`left=%defaultroute` — The local side. `%defaultroute` means use the EC2's own IP automatically.
+
+`leftid=3.231.95.69` — Our public IP as seen by AWS. Must match exactly what was registered in Customer Gateway.
+
+`leftsubnet=192.168.0.0/16` — The on-premises network range being advertised through this tunnel.
+
+`right=18.213.129.131` — The remote side — AWS VPN tunnel endpoint IP from the downloaded config file.
+
+`rightsubnet=10.0.0.0/8` — All AWS networks accessible through this tunnel (covers 10.1, 10.2, 10.3).
+
+`ikev2=insist` — Use IKEv2 only. More secure and efficient than IKEv1.
+
+`ike=aes128-sha256;modp2048` — Phase 1 encryption: AES-128, SHA-256 integrity, DH Group 14. Note: modp1024 (DH Group 2) is blocked on Amazon Linux 2023 — modp2048 must be used.
+
+`esp=aes128-sha256;modp2048` — Phase 2 encryption for the actual data traffic.
+
+`type=tunnel` — Full tunnel mode. Entire original packet is encapsulated and encrypted.
+
+`pfs=no` — Disable Perfect Forward Secrecy for simplicity.
+
+`dpddelay=10` — Send keepalive probe every 10 seconds.
+
+`dpdtimeout=30` — Declare peer dead after 30 seconds with no response.
+
+`dpdaction=restart` — Automatically restart tunnel if peer is declared dead.
+
+`ikelifetime=28800s` — Phase 1 SA lifetime: 8 hours. Matches AWS default.
+
+`salifetime=3600s` — Phase 2 SA lifetime: 1 hour. Matches AWS default.
+
+`keyingtries=%forever` — Never stop trying to establish the tunnel.
+
+#### Create the pre-shared key file
+
+```bash
+cat > /etc/ipsec.d/aws-vpn.secrets << 'EOF'
+3.231.95.69 18.213.129.131 : PSK "kRRUrGQX9dUe7b0.QVtBagASV0ndYjCp"
+EOF
+```
+
+Format: `[local-ip] [remote-ip] : PSK "[key-value]"`
+
+Both IPs must exactly match the config file. The PSK value comes from the downloaded AWS VPN configuration file under Tunnel 1, Pre-Shared Key.
+
+The secrets file must be separate from the config file. Mixing them causes libreswan to fail loading the connection.
+
+#### Start libreswan
+
+```bash
+systemctl enable ipsec
+systemctl start ipsec
+```
+
+`enable` — Configure to start automatically on reboot.
+`start` — Start immediately.
+
+#### Load and bring up the tunnel
+
+```bash
+ipsec auto --add aws-tunnel1
+ipsec auto --up aws-tunnel1
+```
+
+`--add aws-tunnel1` — Load the connection definition from the config file into libreswan's memory.
+
+`--up aws-tunnel1` — Initiate IKE Phase 1 negotiation with AWS. If successful, proceeds to Phase 2 and the tunnel comes up.
+
+Successful output looks like:
+
+```
+003 "aws-tunnel1": initiator established IKE SA
+004 "aws-tunnel1": initiator established Child SA
+    IPsec tunnel 192.168.0.0/16 → 10.0.0.0/8
+    DPD=active
+```
+
+#### Check tunnel status
+
+```bash
+ipsec status
+```
+
+Shows all active connections, SA counts, and tunnel state.
+
+### Step 4 — Disable source/destination check
+
+By default, AWS drops packets where the source or destination IP is not the EC2's own IP. This prevents instances from acting as routers.
+
+StrongSwan needs to forward VPN packets, so this check must be disabled:
+
+EC2 Console → Select OnPrem-StrongSwan → Actions → Networking → Change source/destination check → Disable
+
+This can be done while the instance is running — no reboot required.
+
+### VPN traffic flow end-to-end
+
+```
+OnPrem-EC2 wants to reach App-EC2 (10.2.2.206):
+
+1. Packet leaves OnPrem-EC2 destined for 10.2.2.206
+2. OnPrem-Public-RT: 0.0.0.0/0 → OnPrem-IGW
+3. libreswan XFRM policy intercepts: matches (192.168.0.0/16 → 10.0.0.0/8)
+4. Packet encrypted with AES-128 and sent to 18.213.129.131:4500
+5. AWS TGW VPN endpoint receives and decrypts packet
+6. TGW looks up 10.2.2.206 in TGW-RT-OnPrem
+7. TGW-RT-OnPrem: 10.2.0.0/16 → TGW-Attach-App
+8. Packet delivered to App-EC2 ✅
+```
+
+### Static vs BGP routing
+
+This project used static routing for simplicity. In production environments, BGP (Border Gateway Protocol) is the standard:
+
+| Feature | Static | BGP |
+|---|---|---|
+| Route discovery | Manual | Automatic |
+| New subnet handling | Manual update required | Auto-advertised |
+| Failover | Manual | Automatic |
+| Complexity | Simple | Complex |
+| Enterprise use | Small/simple | Standard |
+
+---
+
+## Test Results
+
+| Test | From | To | Expected | Result |
+|---|---|---|---|---|
+| SSM access | Console | Web-EC2 | ✅ Session opens | ✅ Passed |
+| SSM access | Console | App-EC2 | ✅ Session opens | ✅ Passed |
+| SSM access | Console | DB-EC2 | ✅ Session opens | ✅ Passed |
+| Internet via NAT | App-EC2 | ifconfig.me | ✅ NAT EIP shown | ✅ 3.216.130.49 |
+| Web to App | Web-EC2 | 10.2.2.206 | ✅ Success | ✅ 0% loss |
+| Web to DB | Web-EC2 | 10.3.1.86 | ❌ Blocked | ❌ 100% loss |
+| App to DB | App-EC2 | 10.3.1.86 | ✅ Success | ✅ 0% loss |
+| OnPrem to Web | StrongSwan | 10.1.1.91 | ✅ Success | ✅ 0% loss |
+| OnPrem to App | StrongSwan | 10.2.2.206 | ✅ Success | ✅ 0% loss |
+| OnPrem to DB | StrongSwan | 10.3.1.86 | ❌ Blocked | ❌ 100% loss |
+
+---
+
+## Mistakes Made & How They Were Fixed
+
+### Mistake 1 — Missing IGW for App-VPC
+
+**Problem:** NAT Gateway created without an IGW in App-VPC. NAT Gateway cannot send traffic to the internet without an IGW in the same VPC.
+
+**Fix:** Created App-IGW and attached to App-VPC. Added `0.0.0.0/0 → App-IGW` to App-Public-RT.
+
+**Lesson:** NAT Gateway always needs an IGW in the same VPC. Full chain: EC2 → NAT GW → IGW → Internet. All in same VPC.
+
+---
+
+### Mistake 2 — TGW attachment in wrong subnet
+
+**Problem:** Web-EC2 is in Web-Public-1a but TGW-Attach-Web was placed in Web-Private-1a. This caused asymmetric routing — traffic left via public subnet, return traffic tried to arrive via private subnet ENI. Result: 100% packet loss.
+
+**Fix:** Modified TGW-Attach-Web to use Web-Public-1a — the same subnet as Web-EC2.
+
+**Lesson:** TGW attachment subnet must match the subnet where EC2s that use it are located.
+
+---
+
+### Mistake 3 — Web-Public-RT missing TGW routes
+
+**Problem:** TGW routes were added to Web-Private-RT but Web-EC2 uses Web-Public-RT. Traffic from Web-EC2 to App had no route.
+
+**Fix:** Added `10.2.0.0/16 → TGW` to Web-Public-RT.
+
+**Lesson:** Each subnet uses its own associated route table. Adding routes to one route table does not affect other subnets.
+
+---
+
+### Mistake 4 — DB SSM endpoints had wrong security group
+
+**Problem:** All 3 DB VPC endpoints were created with App-SSM-Endpoint-SG. That SG only allows HTTPS from 10.2.0.0/16. DB EC2 at 10.3.x.x was blocked.
+
+**Fix:** Updated all 3 DB endpoints to use DB-SSM-Endpoint-SG (allows HTTPS from 10.3.0.0/16).
+
+**Lesson:** VPC endpoint security groups must allow traffic from the VPC's own CIDR range.
+
+---
+
+### Mistake 5 — libreswan failing with modp1024
+
+**Problem:** Initial config used modp1024 (DH Group 2) matching the AWS downloaded config. Amazon Linux 2023 blocks modp1024 as insecure.
+
+**Error:** `IKE DH algorithm 'modp1024' is not supported`
+
+**Fix:** Changed to modp2048 (DH Group 14). AWS accepted this.
+
+**Lesson:** AWS config files suggest minimum requirements. Modern Linux distros enforce stronger crypto. Always use at minimum DH Group 14 (modp2048).
+
+---
+
+### Mistake 6 — App-SG not allowing ICMP from OnPrem
+
+**Problem:** App-SG only allowed ICMP from 10.0.0.0/8. OnPrem IP 192.168.1.175 is not in that range.
+
+**Fix:** Added ICMP inbound rule for 192.168.0.0/16 to App-SG and Web-SG.
+
+**Lesson:** Security groups must allow traffic from VPN ranges (192.168.x.x) separately from AWS internal ranges (10.x.x.x).
+
+---
+
+### Mistake 7 — Missing 192.168.0.0/16 static route in TGW-RT-App
+
+**Problem:** TGW-RT-App had no route for OnPrem CIDR. App-EC2 could not reach OnPrem even though tunnel was up.
+
+**Fix:** Added static route `192.168.0.0/16 → VPN attachment` to TGW-RT-App and TGW-RT-Web.
+
+**Lesson:** Propagations only learn VPC CIDRs. VPN CIDRs must always be added as manual static routes.
+
+---
+
+## Key Concepts Explained
+
+### Route isolation vs security groups
+
+Security groups operate at the instance level — they allow or deny traffic based on ports, protocols, and source IP. They are stateful firewalls.
+
+Route isolation operates at the network level — if there is no route, the packet never gets anywhere near the destination. The destination instance never sees it.
+
+This layered approach means even if a security group is misconfigured, route isolation provides a second layer of defense.
+
+### Ping vs internet traffic flow
+
+**Ping to private IP (ping 10.2.2.206):**
+Traffic stays entirely within AWS. NAT Gateway and IGW are not involved.
+```
+Source EC2 → TGW → destination VPC → destination EC2
+```
+
+**Curl to internet (curl ifconfig.me):**
+Traffic exits to internet. NAT Gateway and IGW are involved.
+```
+Source EC2 → NAT GW → IGW → Internet
+```
+
+The route table determines which path is taken based on the destination address.
+
+---
+
+## Cost Analysis
+
+| Resource | Hourly Rate | 4-hour Cost |
+|---|---|---|
+| NAT Gateway | $0.045/hr + $0.045/GB | ~$0.18 |
+| Site-to-Site VPN | $0.05/hr | ~$0.20 |
+| Transit Gateway | $0.05/hr + $0.02/GB data | ~$0.20 |
+| EC2 t2.micro x4 | Free tier | $0.00 |
+| VPC Endpoints x6 | $0.01/hr each | ~$0.24 |
+| Data transfer | $0.01-0.09/GB | ~$0.05 |
+| **Total** | | **~$0.87** |
+
+If left running 24 hours: ~$5-6. Always clean up same day.
+
+Most expensive resources: NAT Gateway ($1.08/day), VPN Connection ($1.20/day), Transit Gateway ($1.20/day).
+
+---
+
+## Cleanup Order
+
+```
+1.  Terminate all 4 EC2 instances — wait for Terminated state
+2.  Delete Site-to-Site VPN Connection — wait for Deleted state
+3.  Delete Customer Gateway
+4.  Delete NAT Gateway — wait for Deleted state
+5.  Release Elastic IP
+6.  Delete all TGW Attachments — wait for Deleted state
+7.  Delete all 4 TGW Route Tables
+8.  Delete Transit Gateway — wait for Deleted state
+9.  Detach and delete all 3 Internet Gateways
+10. Delete all 6 VPC Endpoints — wait for Deleted state
+11. Delete any remaining ENIs in subnets
+12. Delete all 6 custom Route Tables
+13. Delete all 6 Subnets
+14. Delete all Security Groups (skip default SGs)
+15. Delete IAM Role EC2-SSM-Role
+16. Delete all 4 VPCs (skip Default VPC)
+```
+
+---
+
+## Screenshots Index
+
+| File | Description |
+|---|---|
+| p4-01-web-vpc-created.png | Web-VPC created |
+| p4-02-app-vpc-created.png | App-VPC created |
+| p4-03-db-vpc-created.png | DB-VPC created |
+| p4-04-onprem-vpc-created.png | OnPrem-VPC created |
+| p4-05-all-subnets-created.png | All 6 subnets listed |
+| p4-06-igws-attached.png | All 3 IGWs attached |
+| p4-07-nat-gateway-created.png | NAT GW available |
+| p4-08-route-tables-created.png | All 6 route tables |
+| p4-09-route-tables-configured.png | Routes added |
+| p4-10-tgw-created.png | TGW available, defaults disabled |
+| p4-11-tgw-attachments.png | All 3 attachments available |
+| p4-12-tgw-route-tables.png | All 4 TGW RTs |
+| p4-13-tgw-associations.png | Associations configured |
+| p4-14-tgw-propagations.png | Propagations configured |
+| p4-15-vpc-route-tables.png | VPC routes with TGW |
+| p4-16-ssm-iam-role.png | EC2-SSM-Role created |
+| p4-17-ec2-instances.png | All 4 EC2s running |
+| p4-18-ssm-endpoints.png | All 6 endpoints available |
+| p4-19-ssm-app-working.png | SSM on App-EC2 — curl shows NAT IP |
+| p4-20-ssm-db-working.png | SSM on DB-EC2 — ping to App success |
+| p4-21-web-to-app-ping.png | Web → App ping success |
+| p4-22-web-to-db-blocked.png | Web → DB 100% packet loss |
+| p4-23-app-to-db-ping.png | App → DB ping success |
+| p4-24-customer-gateway.png | Customer Gateway created |
+| p4-25-vpn-connection.png | VPN connection available |
+| p4-26-vpn-tunnel-up.png | Tunnel 1 UP in AWS console |
+| p4-27-app-to-onprem-ping.png | App → OnPrem ping success |
+| p4-28-onprem-to-app-ping.png | OnPrem → App ping success |
+| p4-29-onprem-to-web-ping.png | OnPrem → Web ping success |
+| p4-30-onprem-to-db-blocked.png | OnPrem → DB 100% packet loss |
+
+---
+
+*Part of the AWS Networking Projects series by Syed Basit Aftab*
+*GitHub: github.com/saftab4-arch*
